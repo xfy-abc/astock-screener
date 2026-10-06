@@ -91,6 +91,11 @@
   td{padding:4px 0;color:var(--muted)}
   td:last-child{text-align:right;color:var(--text);font-variant-numeric:tabular-nums}
   .empty{text-align:center;color:var(--muted);font-size:12.5px;padding:22px 6px}
+  .posmsg{font-size:12px;margin-top:8px;display:none;padding:8px 10px;border-radius:9px;line-height:1.35}
+  .posmsg.show{display:block}
+  .posmsg.err{background:rgba(244,63,94,.14);color:#ffa8b4;border:1px solid rgba(244,63,94,.35)}
+  .posmsg.ok{background:rgba(52,211,153,.14);color:#8ff0cd;border:1px solid rgba(52,211,153,.35)}
+  .pbtn{background:#1b232d;border:1px solid var(--line);border-radius:8px;padding:4px 10px;font-size:12px}
 </style>
 </head>
 <body>
@@ -153,13 +158,19 @@
     </div>
 
     <div class="card">
-      <h2>添加持仓</h2>
-      <label class="field"><span>股票代码</span><input type="text" id="pCode" inputmode="numeric" placeholder="600000"></label>
+      <h2 id="posFormTitle">添加持仓</h2>
+      <label class="field"><span>股票代码</span><input type="text" id="pCode" inputmode="numeric" maxlength="6" placeholder="600000"></label>
       <label class="field"><span>名称（可空）</span><input type="text" id="pName" placeholder="浦发银行"></label>
       <label class="field"><span>成本价</span><input type="number" id="pCost" step="0.01" inputmode="decimal" placeholder="10.00"></label>
       <label class="field"><span>数量（股）</span><input type="number" id="pShares" inputmode="numeric" placeholder="1000"></label>
-      <button class="primary wide" id="addPosBtn" style="margin-top:10px">加入持仓监控</button>
-      <div class="mini muted" style="margin-top:6px">仅支持沪市主板 60 开头、深市主板 000 开头。</div>
+      <div id="posFormMsg" class="posmsg"></div>
+      <div class="row" style="gap:8px;margin-top:8px">
+        <button class="primary" id="addPosBtn" style="flex:1">加入持仓监控</button>
+        <button id="cancelEditBtn" class="hide" style="flex:none">取消修改</button>
+      </div>
+      <div class="mini muted" style="margin-top:6px">
+        持仓监控不限板块：创业板、科创板、北交所、001/002/003 都能加（只是「选股扫描」仍然只扫沪市主板 60 与深市主板 000）。
+      </div>
     </div>
 
     <div class="card" style="padding:0">
@@ -319,7 +330,20 @@ const BUNDLED_HOLIDAYS = [
 
 const $ = function (id) { return document.getElementById(id); };
 const load = function (k, d) { try { const v = JSON.parse(localStorage.getItem(k)); return (v === null || v === undefined) ? d : v; } catch (e) { return d; } };
-const save = function (k, v) { try { localStorage.setItem(k, JSON.stringify(v)); } catch (e) { console.warn(e); } };
+/* 返回是否真的写进去了：写失败必须让用户看见，不能静默失败 */
+const save = function (k, v) {
+  try { localStorage.setItem(k, JSON.stringify(v)); return true; }
+  catch (e) { console.warn('保存失败', k, e); return false; }
+};
+/* Safari 无痕模式 / 关闭网站数据时，localStorage 会直接不可用 */
+function storageAvailable() {
+  try {
+    const t = '__t' + Date.now();
+    localStorage.setItem(t, '1');
+    localStorage.removeItem(t);
+    return true;
+  } catch (e) { return false; }
+}
 const qs = function (o) { return Object.keys(o).map(function (k) { return encodeURIComponent(k) + '=' + encodeURIComponent(o[k]); }).join('&'); };
 const beijingDate = function (d) {
   return new Intl.DateTimeFormat('en-CA', { timeZone: 'Asia/Shanghai', year: 'numeric', month: '2-digit', day: '2-digit' }).format(d || new Date());
@@ -506,7 +530,12 @@ async function fetchUniverse() {
   return out;
 }
 
-function secidOf(code) { return (code.indexOf('60') === 0 ? '1.' : '0.') + code; }
+/* 各板块都要能取到 K 线（持仓监控不限板块）：
+   沪市 6xx/5xx/9xx → 1.；深市 0xx/3xx/2xx、北交所 4xx/8xx/920 → 0. */
+function secidOf(code) {
+  const c = String(code).charAt(0);
+  return (c === '6' || c === '5' || c === '9') ? '1.' + code : '0.' + code;
+}
 
 async function fetchKlines(code, period, limit) {
   const res = await jsonp('https://push2his.eastmoney.com/api/qt/stock/kline/get', {
@@ -539,19 +568,17 @@ async function fetchLatestPrice(code) {
   return (p && p > 0) ? Number(p) : null;
 }
 
-/* K 线当日缓存（localStorage） */
+/* K 线缓存只放内存里。
+   之前存在 localStorage，几百只股票就有好几 MB，会把浏览器 5MB 配额占满，
+   导致持仓/设置这些真正重要的数据写不进去。 */
+const memKLine = new Map();
 function cacheGet(key) {
-  const c = load(LS.kline, {});
-  const hit = c[key];
+  const hit = memKLine.get(key);
   if (hit && hit.date === beijingDate()) return hit.bars;
   return null;
 }
-function cacheSet(key, bars) {
-  const c = load(LS.kline, {});
-  c[key] = { date: beijingDate(), bars: bars };
-  try { save(LS.kline, c); } catch (e) { save(LS.kline, {}); }
-}
-function cacheClear() { save(LS.kline, {}); }
+function cacheSet(key, bars) { memKLine.set(key, { date: beijingDate(), bars: bars }); }
+function cacheClear() { memKLine.clear(); }
 
 /* ------------------------------ 策略引擎 ------------------------------ */
 
@@ -824,7 +851,9 @@ async function runScan(clearKlineCache) {
             candidates.push({
               item: r.item, hitCount: out.hitCount, score: out.score,
               s1: out.s1, s2: out.s2, s3: out.s3, notes: out.notes, metrics: out.metrics,
-              dailyTail: r.daily.slice(-90), weeklyTail: r.weekly.slice(-60), updatedAt: Date.now()
+              /* 只留收盘价画迷你图；完整 K 线不落地，省下浏览器存储空间 */
+              spark: r.daily.slice(-60).map(function (b) { return b.close; }),
+              updatedAt: Date.now()
             });
           }
         }
@@ -966,7 +995,9 @@ function renderCandidates() {
         '<span class="score">评分 ' + c.score + '</span>' +
       '</div>' +
       '<div class="row" style="margin-top:8px;gap:10px">' +
-        '<div style="width:88px;flex:none">' + sparkline((c.dailyTail || []).map(function (b) { return b.close; })) + '</div>' +
+        '<div style="width:88px;flex:none">' +
+          sparkline(c.spark || (c.dailyTail || []).map(function (b) { return b.close; })) +
+        '</div>' +
         '<div class="mini muted grow">成交额 ' + fmtMoney(it.amount) + ' · 量比 ' + Number(it.volumeRatio).toFixed(2) +
           '<br>' + (m.volumeMultiple != null ? '较昨日量比 ' + m.volumeMultiple.toFixed(2) + ' · ' : '') +
           '换手 ' + Number(it.turnoverRate).toFixed(2) + '%</div>' +
@@ -1017,23 +1048,34 @@ function renderSignals(signals) {
 function renderPositions() {
   const list = load(LS.positions, []);
   const box = $('positionList');
+  const cfg = load(LS.config, DEFAULT_CONFIG);
   if (!list.length) {
-    box.innerHTML = '<div class="empty">还没有持仓</div>';
+    box.innerHTML = '<div class="empty">还没有持仓，在上面的表单里添加</div>';
     return;
   }
   box.innerHTML = list.map(function (p) {
+    const scanned = inScope(p.code, cfg);
     return '<div class="stock">' +
       '<div class="row between">' +
         '<div><span style="font-weight:640">' + esc(p.name) + '</span> ' +
-        '<span class="mini muted">' + p.code + '</span></div>' +
-        '<button class="danger" style="padding:4px 10px;font-size:12px" data-del="' + p.id + '">删除</button>' +
+        '<span class="mini muted">' + p.code + '</span>' +
+        (scanned ? '' : ' <span class="chip gray">不在扫描范围</span>') + '</div>' +
+        '<div class="row" style="gap:6px">' +
+          '<button class="pbtn" data-edit="' + p.id + '">修改</button>' +
+          '<button class="pbtn danger" data-del="' + p.id + '">删除</button>' +
+        '</div>' +
       '</div>' +
       '<div class="mini muted" style="margin-top:3px">成本 ' + fmtPrice(p.cost) + ' · 数量 ' + (p.shares || 0) + '</div>' +
     '</div>';
   }).join('');
-  const btns = box.querySelectorAll('button[data-del]');
-  for (let i = 0; i < btns.length; i++) {
-    btns[i].addEventListener('click', function () { removePosition(this.getAttribute('data-del')); });
+
+  const dels = box.querySelectorAll('button[data-del]');
+  for (let i = 0; i < dels.length; i++) {
+    dels[i].addEventListener('click', function () { removePosition(this.getAttribute('data-del')); });
+  }
+  const edits = box.querySelectorAll('button[data-edit]');
+  for (let i = 0; i < edits.length; i++) {
+    edits[i].addEventListener('click', function () { editPosition(this.getAttribute('data-edit')); });
   }
 }
 
@@ -1200,9 +1242,107 @@ function quickAdd(code, name, price) {
   toast('已填入表单，补充数量后点“加入持仓监控”');
 }
 
+/* -------------------------- 持仓：增 / 改 / 删 -------------------------- */
+
+let editingId = null;
+
+function posMsg(text, kind) {
+  const el = $('posFormMsg');
+  if (!text) { el.className = 'posmsg'; el.textContent = ''; return; }
+  el.className = 'posmsg show ' + (kind === 'ok' ? 'ok' : 'err');
+  el.textContent = text;
+}
+
+function resetPosForm() {
+  editingId = null;
+  $('pCode').value = '';
+  $('pName').value = '';
+  $('pCost').value = '';
+  $('pShares').value = '';
+  $('posFormTitle').textContent = '添加持仓';
+  $('addPosBtn').textContent = '加入持仓监控';
+  $('cancelEditBtn').classList.add('hide');
+  posMsg('');
+}
+
+/** 点「修改」：把该持仓填进表单，按钮变成保存 */
+function editPosition(id) {
+  const p = load(LS.positions, []).find(function (x) { return String(x.id) === String(id); });
+  if (!p) { posMsg('没找到这条持仓，可能已被删除。'); return; }
+  editingId = String(id);
+  $('pCode').value = p.code;
+  $('pName').value = p.name;
+  $('pCost').value = p.cost;
+  $('pShares').value = p.shares || '';
+  $('posFormTitle').textContent = '修改持仓：' + p.name + '（' + p.code + '）';
+  $('addPosBtn').textContent = '保存修改';
+  $('cancelEditBtn').classList.remove('hide');
+  posMsg('修改后点「保存修改」。代码也可以一并改。', 'ok');
+  switchTab('positions');
+  const card = $('posFormTitle');
+  if (card && card.scrollIntoView) card.scrollIntoView({ block: 'center' });
+}
+
+function submitPosition() {
+  const code = String($('pCode').value || '').trim();
+  const name = String($('pName').value || '').trim() || code;
+  const costRaw = String($('pCost').value || '').trim();
+  const sharesRaw = String($('pShares').value || '').trim();
+  const cost = Number(costRaw);
+  const shares = sharesRaw === '' ? 0 : Number(sharesRaw);
+
+  if (!/^\d{6}$/.test(code)) {
+    return posMsg('股票代码要填 6 位数字，例如 600000、000001、300750、688111。');
+  }
+  if (!costRaw || !isFinite(cost) || cost <= 0) {
+    return posMsg('成本价要填大于 0 的数字，例如 12.35。');
+  }
+  if (!isFinite(shares) || shares < 0) {
+    return posMsg('数量填股数（整数），比如 1000；不填按 0 处理。');
+  }
+  if (!storageAvailable()) {
+    return posMsg('浏览器存储不可用，所以存不进去。常见原因：Safari 无痕模式，或 设置 → Safari 里关闭了「网站数据」。关掉无痕 / 允许网站数据后重试。');
+  }
+
+  const list = load(LS.positions, []);
+
+  if (editingId) {
+    let hit = false;
+    for (let i = 0; i < list.length; i++) {
+      if (String(list[i].id) === editingId) {
+        list[i] = Object.assign({}, list[i], { code: code, name: name, cost: cost, shares: shares });
+        hit = true;
+        break;
+      }
+    }
+    if (!hit) { resetPosForm(); return posMsg('要修改的持仓已经不在了，请重新添加。'); }
+    if (!save(LS.positions, list)) {
+      return posMsg('写入失败：浏览器存储空间可能已满。到「设置 → 清空缓存」后重试。');
+    }
+    resetPosForm();
+    renderPositions();
+    posMsg('已保存修改。', 'ok');
+    toast('已修改持仓');
+    return;
+  }
+
+  list.push({
+    id: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    code: code, name: name, cost: cost, shares: shares, createdAt: Date.now()
+  });
+  if (!save(LS.positions, list)) {
+    return posMsg('写入失败：浏览器存储空间可能已满。到「设置 → 清空缓存」后重试。');
+  }
+  resetPosForm();
+  renderPositions();
+  posMsg('已加入：' + name + '（' + code + '）。下次扫描时会一并校验止盈/止损。', 'ok');
+  toast('已加入持仓监控');
+}
+
 function removePosition(id) {
   const list = load(LS.positions, []).filter(function (p) { return String(p.id) !== String(id); });
-  save(LS.positions, list);
+  if (!save(LS.positions, list)) { toast('删除失败，请重试'); return; }
+  if (editingId === String(id)) resetPosForm();
   renderPositions();
   toast('已删除');
 }
@@ -1245,24 +1385,8 @@ function bind() {
   });
   $('notifyBtn').addEventListener('click', enableNotifications);
 
-  $('addPosBtn').addEventListener('click', function () {
-    const code = $('pCode').value.trim();
-    const name = $('pName').value.trim() || code;
-    const cost = Number($('pCost').value);
-    const shares = Number($('pShares').value) || 0;
-    if (!/^\d{6}$/.test(code)) { toast('股票代码需为 6 位数字'); return; }
-    if (!(code.indexOf('60') === 0 || code.indexOf('000') === 0)) { toast('仅支持 60 / 000 开头'); return; }
-    if (!(cost > 0)) { toast('成本价需大于 0'); return; }
-    const list = load(LS.positions, []);
-    list.push({
-      id: 'p' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
-      code: code, name: name, cost: cost, shares: shares, createdAt: Date.now()
-    });
-    save(LS.positions, list);
-    $('pCode').value = ''; $('pName').value = ''; $('pCost').value = ''; $('pShares').value = '';
-    renderPositions();
-    toast('已加入持仓监控');
-  });
+  $('addPosBtn').addEventListener('click', submitPosition);
+  $('cancelEditBtn').addEventListener('click', function () { resetPosForm(); });
 
   $('addHolidayBtn').addEventListener('click', function () {
     const v = $('holidayInput').value;
@@ -1275,7 +1399,11 @@ function bind() {
     toast('已添加 ' + v);
   });
 
-  $('clearCacheBtn').addEventListener('click', function () { cacheClear(); toast('K 线缓存已清空'); });
+  $('clearCacheBtn').addEventListener('click', function () {
+    cacheClear();
+    try { localStorage.removeItem(LS.kline); } catch (e) { /* ignore */ }
+    toast('缓存已清空');
+  });
   $('clearCandidatesBtn').addEventListener('click', function () {
     save(LS.candidates, []);
     save(SIGNALS_KEY, []);
@@ -1315,8 +1443,14 @@ function bind() {
 }
 
 function boot() {
+  // 旧版本把行情缓存塞在 localStorage 里，几百只股票就能占满 5MB 配额，
+  // 导致持仓、设置这些真正要保存的数据写不进去。启动时清掉它。
+  try { localStorage.removeItem(LS.kline); } catch (e) { /* 存储不可用时忽略 */ }
+
   const cfg = Object.assign({}, DEFAULT_CONFIG, load(LS.config, {}));
-  save(LS.config, cfg);
+  if (!save(LS.config, cfg)) {
+    console.warn('配置写入失败');
+  }
   cfgToForm(cfg);
   bind();
   renderCandidates();
@@ -1336,6 +1470,12 @@ function boot() {
   if (meta && meta.at) {
     const mins = Math.round((Date.now() - meta.at) / 60000);
     logLine('上次扫描：' + mins + ' 分钟前，命中候选 ' + load(LS.candidates, []).length + ' 只');
+  }
+
+  if (!storageAvailable()) {
+    logLine('⚠️ 浏览器存储不可用：持仓和设置都保存不了。请关闭无痕模式，或在 设置 → Safari → 高级 → 网站数据 中允许保存。');
+    $('posFormMsg').className = 'posmsg show err';
+    $('posFormMsg').textContent = '提示：当前浏览器不允许保存数据（无痕模式或已关闭网站数据），持仓会存不住。';
   }
 }
 
